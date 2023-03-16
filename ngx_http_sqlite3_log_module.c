@@ -7,7 +7,6 @@
 
 #include <stdio.h>
 #include <sqlite3.h>
-#include "ngx_log.h"
 
 /*
  * This is the main configuration struct, which holds module-specific data.
@@ -21,40 +20,39 @@ typedef struct {
     ngx_int_t    transaction_max;
     
     sqlite3      *db;
+    u_char       *sql_create_table;
+    u_char       *sql_insert;
     ngx_int_t    transaction_counter;
 } ngx_http_sqlite3_log_main_conf_t;
 
 /*
- * Module functions
+ * Module-specific functions
  */
-static char*     ngx_http_sqlite3_log_set_columns(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t ngx_http_sqlite3_log_init(ngx_conf_t *cf);
-static ngx_int_t ngx_http_sqlite3_log_handler(ngx_http_request_t *r);
-static void*     ngx_http_sqlite3_log_create_main_conf(ngx_conf_t *cf);
-static char*     ngx_http_sqlite3_log_init_main_conf(ngx_conf_t *cf, void *conf);
-
+static char*        ngx_http_sqlite3_log_set_columns(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t    ngx_http_sqlite3_log_init(ngx_conf_t *cf);
+static ngx_int_t    ngx_http_sqlite3_log_handler(ngx_http_request_t *r);
+static void*        ngx_http_sqlite3_log_create_main_conf(ngx_conf_t *cf);
+static char*        ngx_http_sqlite3_log_init_main_conf(ngx_conf_t *cf, void *conf);
+static void         ngx_http_sqlite3_log_cleanup(void *data);
 /*
- * SQL utility functions
+ * ngx_http_sqlite3_log_sql_*       SQL string creation
+ * ngx_http_sqlite3_log_strings_*   general string functions
+ * ngx_http_sqlite3_log_db_*        database functions
+ * ngx_http_sqlite3_log_lm_*        functions copied from the log module :)
  */
-u_char* ngx_http_sqlite3_log_sql_create_table_if_not_exists(ngx_pool_t* pool, ngx_array_t* columns);
-u_char* ngx_http_sqlite3_log_sql_insert(ngx_pool_t* pool, ngx_uint_t n);
-
-/*
- * String utility functions
- */
-u_char*      ngx_http_sqlite3_log_strings_join(ngx_pool_t *pool, ngx_array_t *strings, const u_char delimiter);
-size_t       ngx_http_sqlite3_log_strings_len_total(ngx_array_t *strings);
-ngx_array_t* ngx_http_sqlite3_log_strings_array(ngx_pool_t *pool, const char* s, size_t s_len, ngx_uint_t n);
-
-/*
- * SQLite3 utility functions
- */
-int  ngx_http_sqlite3_log_db_open(ngx_pool_t *pool, ngx_http_sqlite3_log_main_conf_t *mc);
-int  ngx_http_sqlite3_log_db_create_table_if_not_exists(ngx_pool_t *pool, sqlite3 *db, ngx_array_t* columns);
-int  ngx_http_sqlite3_log_db_transaction_begin(sqlite3 *db);
-int  ngx_http_sqlite3_log_db_transaction_commit(sqlite3 *db);
-int  ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_main_conf_t *mc);
-void ngx_http_sqlite3_log_db_cleanup(void *data);
+static u_char*      ngx_http_sqlite3_log_sql_create_table_if_not_exists(ngx_array_t *columns, ngx_log_t *log);
+static u_char*      ngx_http_sqlite3_log_sql_insert(ngx_pool_t *pool, ngx_uint_t n, ngx_log_t *log);
+static u_char*      ngx_http_sqlite3_log_strings_join(ngx_array_t *strings, const u_char delimiter, ngx_log_t *log);
+static size_t       ngx_http_sqlite3_log_strings_len_total(ngx_array_t *strings);
+static ngx_array_t* ngx_http_sqlite3_log_strings_array(ngx_pool_t *pool, const char* s, size_t s_len, ngx_uint_t n);
+static int          ngx_http_sqlite3_log_db_open(ngx_http_sqlite3_log_main_conf_t *mc);
+static int          ngx_http_sqlite3_log_db_create_table_if_not_exists(sqlite3 *db, u_char *sql);
+static int          ngx_http_sqlite3_log_db_transaction_begin(sqlite3 *db);
+static int          ngx_http_sqlite3_log_db_transaction_commit(sqlite3 *db);
+static int          ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_main_conf_t *mc);
+static u_char*      ngx_http_sqlite3_log_lm_variable(ngx_http_request_t *r, u_char *buf, ngx_int_t index);
+static size_t       ngx_http_sqlite3_log_lm_variable_getlen(ngx_http_request_t *r, uintptr_t data);
+static uintptr_t    ngx_http_sqlite3_log_lm_escape(u_char *dst, u_char *src, size_t size);
 
 /*
  * This array defines the directives provided by the module. See the README.md
@@ -160,6 +158,12 @@ ngx_module_t  ngx_http_sqlite3_log_module = {
     NGX_MODULE_V1_PADDING
 };
 
+/*
+ * Perform initalization tasks at the postconfiguration step.
+ * 
+ * @param       cf
+ * @return      NGX_OK on success, else NGX_ERROR
+ */
 static ngx_int_t ngx_http_sqlite3_log_init(ngx_conf_t *cf) {
     /*
      * Get the core main conf.
@@ -180,6 +184,12 @@ static ngx_int_t ngx_http_sqlite3_log_init(ngx_conf_t *cf) {
     return NGX_OK;
 }
 
+/*
+ * Process the current web request.
+ * 
+ * @param   r       the request to process
+ * @return          NGX_OK on success, else NGX_ERROR
+ */
 static ngx_int_t ngx_http_sqlite3_log_handler(ngx_http_request_t *r) {
     /*
      * If the module is off, exit immediately.
@@ -195,7 +205,7 @@ static ngx_int_t ngx_http_sqlite3_log_handler(ngx_http_request_t *r) {
      * If the database hasn't been opened, create and/or open it now.
      */
     if (mc->db == NULL) {
-        int rc = ngx_http_sqlite3_log_db_open(r->pool, mc);
+        int rc = ngx_http_sqlite3_log_db_open(mc);
         printf("ngx_http_sqlite3_log_db_open() returned %d \n", rc);
         if (rc != SQLITE_OK) {
             return NGX_ERROR;
@@ -219,7 +229,7 @@ static ngx_int_t ngx_http_sqlite3_log_handler(ngx_http_request_t *r) {
     
     
     /*
-     * Write/insert the log data.
+     * Write the log data.
      */
     int rc = ngx_http_sqlite3_log_db_insert(r, mc);
     printf("ngx_http_sqlite3_log_db_insert() returned %d \n", rc);
@@ -243,7 +253,12 @@ static ngx_int_t ngx_http_sqlite3_log_handler(ngx_http_request_t *r) {
 }
 
 /*
- * This is the set function for the "sqlite3_log_columns" directive.
+ * Set the columns from the the "sqlite3_log_columns" directive.
+ * 
+ * @param   cf      an object containing the user's args
+ * @param   cmd     a pointer to the directive object
+ * @param   conf    this module's custom configuration struct
+ * @return          an NGX_CONF_{x} status
  */
 static char* ngx_http_sqlite3_log_set_columns(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     /*
@@ -260,7 +275,7 @@ static char* ngx_http_sqlite3_log_set_columns(ngx_conf_t *cf, ngx_command_t *cmd
      * its index.
      */
     printf("ngx_http_sqlite3_log_set_columns allocate arrays \n");
-    ngx_http_sqlite3_log_main_conf_t* mc = conf;
+    ngx_http_sqlite3_log_main_conf_t *mc = conf;
     mc->columns = ngx_array_create(cf->pool, args_len, sizeof(ngx_str_t));
     mc->indeces = ngx_array_create(cf->pool, args_len, sizeof(ngx_int_t));
     
@@ -333,6 +348,11 @@ static char* ngx_http_sqlite3_log_set_columns(ngx_conf_t *cf, ngx_command_t *cmd
     return NGX_CONF_OK;
 }
 
+/*
+ * Create the this module's main configuration struct.
+ * 
+ * @param   cf
+ */
 static void* ngx_http_sqlite3_log_create_main_conf(ngx_conf_t *cf) {
     /*
      * There's a lot going on here that warrants some explanation.
@@ -353,7 +373,7 @@ static void* ngx_http_sqlite3_log_create_main_conf(ngx_conf_t *cf) {
      *
      * If you want to see an example of this in action in the Nginx codebase
      * itself, look at at the create_main_conf() function in 
-     * http/modules/ngx_http_proxy_module.c.
+     * src/http/modules/ngx_http_proxy_module.c.
      * 
      * In this case, ngx_pcalloc() is intializing the following.
      * 
@@ -377,12 +397,14 @@ static void* ngx_http_sqlite3_log_create_main_conf(ngx_conf_t *cf) {
 }
 
 /*
- * ngx_http_sqlite3_log_init_main_conf() sets the default values for all
- * commands/directives.
+ * Set the default values for every directive.
  * 
  * Despite having "init" in its name, this function actually gets called AFTER
  * each command's "set" function, not before.
  * 
+ * @param   cf
+ * @param   conf        this module's custom configuration struct
+ * @return              an NGX_CONF_{x} status
  */
 static char* ngx_http_sqlite3_log_init_main_conf(ngx_conf_t *cf, void *conf) {
     printf("ngx_http_sqlite3_log_init_main_conf() \n");
@@ -478,27 +500,40 @@ static char* ngx_http_sqlite3_log_init_main_conf(ngx_conf_t *cf, void *conf) {
     mc->transaction_counter = 0;
     
     /*
-     * Assign the cleanup function to the Nginx global cycle's pool.
+     * Create the SQL strings now so we don't have to recreate them in the
+     * event that the database file gets deleted while Nginx is running.
+     * 
+     * These are heap strings that will be freed during the cleanup process
+     * set up below.
+     */
+    u_char *sql_create_table = ngx_http_sqlite3_log_sql_create_table_if_not_exists(mc->columns, cf->log);
+    u_char *sql_insert = ngx_http_sqlite3_log_sql_insert(cf->pool, mc->columns->nelts, cf->log);
+    if (sql_create_table == NULL || sql_insert == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    mc->sql_create_table = sql_create_table;
+    mc->sql_insert = sql_insert;
+    
+    /*
+     * Assign the cleanup functions to the Nginx global cycle's pool.
      */
     ngx_pool_cleanup_t *cleanup = NULL;
     cleanup = ngx_pool_cleanup_add(cf->pool, 0);
     if (cleanup == NULL) {
         return NGX_CONF_ERROR;
     }
-    cleanup->handler = ngx_http_sqlite3_log_db_cleanup;
+    cleanup->handler = ngx_http_sqlite3_log_cleanup;
     cleanup->data = mc;
-    
     return NGX_CONF_OK;
 }
 
 /*
- * Open the database file for the configuration struct.
+ * Open the database file.
  * 
- * @param   pool    an Nginx memory pool to borrow memory from
  * @param   mc      the module's main configuration struct
  * @return          a SQLite3 status code
  */
-int ngx_http_sqlite3_log_db_open(ngx_pool_t *pool, ngx_http_sqlite3_log_main_conf_t *mc) {
+static int ngx_http_sqlite3_log_db_open(ngx_http_sqlite3_log_main_conf_t *mc) {
     /*
      * Open the database connection.
      */
@@ -516,7 +551,7 @@ int ngx_http_sqlite3_log_db_open(ngx_pool_t *pool, ngx_http_sqlite3_log_main_con
     /*
      * Create the log table if it doesn't already exist.
      */
-    rc = ngx_http_sqlite3_log_db_create_table_if_not_exists(pool, mc->db, mc->columns);
+    rc = ngx_http_sqlite3_log_db_create_table_if_not_exists(mc->db, mc->sql_create_table);
     if (rc != SQLITE_OK) {
         return rc;
     }
@@ -524,92 +559,18 @@ int ngx_http_sqlite3_log_db_open(ngx_pool_t *pool, ngx_http_sqlite3_log_main_con
 }
 
 /*
- * Check if the log table exists.
- * 
- * @param   db      the database to check
- * @param   exists  a pointer to an integer where 1 or 0 will be stored
- * @return          a SQLite3 return code
- */
-int ngx_http_sqlite3_log_db_table_exists(sqlite3 *db, int *exists) {
-    /*
-     * Prepare the SQL and result values.
-     */
-    const char* sql = ""
-    "SELECT EXISTS ("
-    "   SELECT *"
-    "   FROM sqlite_master"
-    "   WHERE type='table' and name='log'"
-    ")";
-    char** result = NULL;
-    int rows = 0;
-    int cols = 0;
-    char* error_message = NULL;
-    
-    /*
-     * Execute the SQL.
-     */
-    int rc = sqlite3_get_table(db, sql, &result, &rows, &cols, &error_message);
-    if (rc != SQLITE_OK) {
-        if (error_message) {
-            printf("error_message = %s \n", error_message);
-            goto end;
-        }
-    }
-    
-    /*
-     * The result should be the following table:
-     * 
-     * EXISTS
-     * ------
-     * 1
-     */
-    if (rows != 2) {
-        printf("rows is %d instead of 2 \n", rows);
-    }
-    else if (cols != 1) {
-        printf("cols is %d instead of 1 \n", cols);
-    }
-    else {
-        int cmp = ngx_strcmp(result[1], "1");
-        if (cmp == 0) {
-            *exists = 1;
-        }
-        else {
-            *exists = 0;
-        }
-    }
-    
-    /*
-     * Free resources and return.
-     */
-    end:
-    sqlite3_free(error_message);
-    sqlite3_free_table(result);
-    return rc;
-}
-
-/*
- * Create the "log" table according to the arguments provided in the user's
- * .conf file.
+ * Execute a CREATE TABLE IF NOT EXISTS statement.
  *
- * @param   pool    an Nginx memory pool to borrow memory from
  * @param   db      a connection to the database
- * @param   columns an Nginx array of column names
+ * @param   sql     a SQL string
  * @return          a SQLite3 return code
  */
-int ngx_http_sqlite3_log_db_create_table_if_not_exists(ngx_pool_t *pool, sqlite3 *db, ngx_array_t* columns) {
-    /*
-     * Prepare the "CREATE TABLE IF NOT EXISTS" statement.
-     */
-    char* sql = (char*) ngx_http_sqlite3_log_sql_create_table_if_not_exists(pool, columns);
+static int ngx_http_sqlite3_log_db_create_table_if_not_exists(sqlite3 *db, u_char *sql) {
+    char* sqlcs = (char*) sql;
     int (*callback)(void* data, int cols, char** rowdata, char** column_names) = NULL;
     void *callback_data = NULL;
     char* error_message = NULL;
-    
-    /*
-     * Execute the statement.
-     */
-    int rc = sqlite3_exec(db, sql, callback, callback_data, &error_message);
+    int rc = sqlite3_exec(db, sqlcs, callback, callback_data, &error_message);
     if (rc != SQLITE_OK) {
         if (error_message) {
             puts(error_message);
@@ -625,7 +586,7 @@ int ngx_http_sqlite3_log_db_create_table_if_not_exists(ngx_pool_t *pool, sqlite3
  * @param   db      a connection to the database
  * @return          a SQLite3 return code
  */
-int ngx_http_sqlite3_log_db_transaction_begin(sqlite3 *db) {
+static int ngx_http_sqlite3_log_db_transaction_begin(sqlite3 *db) {
     /*
      * Prepare the exec args.
      */
@@ -653,7 +614,7 @@ int ngx_http_sqlite3_log_db_transaction_begin(sqlite3 *db) {
  * @param   db      a connection to the database
  * @return          a SQLite3 return code
  */
-int ngx_http_sqlite3_log_db_transaction_commit(sqlite3 *db) {
+static int ngx_http_sqlite3_log_db_transaction_commit(sqlite3 *db) {
     /*
      * Prepare the exec args.
      */
@@ -676,21 +637,17 @@ int ngx_http_sqlite3_log_db_transaction_commit(sqlite3 *db) {
 }
 
 /*
- * Insert a record into the database.
- * 
- * This function can return 2 possible success codes:
- *      1. SQLITE_OK from sqlite3_prepare_v2() and sqlite3_bind_text()
- *      2. SQLITE_DONE from sqlite3_step()
+ * Log the current web request to the database.
  * 
  * @param   r   the request to log
- * @param   mc  the module's main configuration struct
+ * @param   mc  this module's main configuration struct
  * @return      a SQLite3 return code
  */
-int ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_main_conf_t *mc) {
+static int ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_main_conf_t *mc) {
     /*
-     * Prepare the INSERT statement.
+     * Prepare the INSERT statement object.
      */
-    char* sql_insert = (char*) ngx_http_sqlite3_log_sql_insert(r->pool, mc->indeces->nelts);
+    char* sql_insert = (char*) mc->sql_insert;
     size_t sql_insert_len = ngx_strlen(sql_insert);
     printf("mc->indeces->nelts = %ld \n", mc->indeces->nelts);
     printf("sql_insert = %s \n", sql_insert);
@@ -703,17 +660,18 @@ int ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_m
     }
     
     /*
-     * Bind each log value to the INSERT statement.
+     * Extract the appropriate values from the request and bind them to the
+     * INSERT statement.
      */
     ngx_str_t* s = mc->columns->elts;
     ngx_int_t* i = mc->indeces->elts;
     for (ngx_uint_t j=0; j<mc->columns->nelts; j++) {
         /*
-         * Get the current value.
+         * Get the value to insert.
          */
-        size_t var_len = ngx_http_log_variable_getlen(r, *i);
+        size_t var_len = ngx_http_sqlite3_log_lm_variable_getlen(r, *i);
         u_char* buf = ngx_pcalloc(r->pool, var_len+1);
-        ngx_http_log_variable(r, buf, *i);
+        ngx_http_sqlite3_log_lm_variable(r, buf, *i);
         
         /*
          * Bind it to the INSERT statement.
@@ -727,7 +685,7 @@ int ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_m
         printf("    %ld %s = %s\n", *i, s->data, buf);
         
         /*
-         * Next
+         * Move onto the next column/index pair.
          */
         s++;
         i++;
@@ -744,33 +702,30 @@ int ngx_http_sqlite3_log_db_insert(ngx_http_request_t *r, ngx_http_sqlite3_log_m
     }
     
     /*
-     * SQLite3 has 3 different codes indicating success:
-     * 
-     *  1. SQLITE_OK
-     *  2. SQLITE_ROW
-     *  3. SQLITE_DONE
-     * 
-     * To keep things simple, all success codes will be decayed to SQLITE_OK.
+     * Finalize the statement.
      */
     end:
-    if (rc == SQLITE_ROW || rc == SQLITE_DONE) {
-        rc = SQLITE_OK;
-    }
-    sqlite3_finalize(stmt);
+    rc = sqlite3_finalize(stmt);
     return rc;
 }
 
 /*
- * Execute any pending inserts and close the database.
+ * Perform cleanup duties.
  * 
- * @param   data    the module's custom configuration struct
+ * @param   data    this module's custom configuration struct
  */
-void ngx_http_sqlite3_log_db_cleanup(void *data) {
+static void ngx_http_sqlite3_log_cleanup(void *data) {
     /*
-     * If the database was never opened, there's nothing to do.
+     * Free the SQL strings that were created in init_main_conf().
+     */
+    ngx_http_sqlite3_log_main_conf_t *mc = data;
+    ngx_free(mc->sql_create_table);
+    ngx_free(mc->sql_insert);
+    
+    /*
+     * If the database was never opened, there's nothing else to do.
      */
     puts("ngx_http_sqlite3_log_db_cleanup()");
-    ngx_http_sqlite3_log_main_conf_t *mc = data;
     if (mc->db == NULL) {
         return;
     };
@@ -797,30 +752,32 @@ void ngx_http_sqlite3_log_db_cleanup(void *data) {
 /*
  * Create a "CREATE TABLE IF NOT EXISTS" string with the given column names.
  * 
- * @param   pool    an Nginx memory pool to borrow memory from
- * @param   columns an Nginx array of column names
- * @return          a heap string allocated in the given pool
+ * Don't forget to free the string with ngx_free().
+ * 
+ * @param   columns     an Nginx array of column names
+ * @param   log         a log for logging heap allocation errors
+ * @return              a heap string
  */
-u_char* ngx_http_sqlite3_log_sql_create_table_if_not_exists(ngx_pool_t* pool, ngx_array_t* columns) {
+static u_char* ngx_http_sqlite3_log_sql_create_table_if_not_exists(ngx_array_t* columns, ngx_log_t *log) {
     /*
      * Count how many characters the SQL statement will have.
      */
     ngx_str_t init_text = ngx_string("CREATE TABLE IF NOT EXISTS log (");
-    size_t sql_len = init_text.len;                          // initial text
+    size_t sql_len = init_text.len;     // initial text
     sql_len += ngx_http_sqlite3_log_strings_len_total(columns); // column names
-    sql_len += columns->nelts;                               // commas
-    sql_len += 1;                                            // closing parenthesis
-    sql_len += 1;                                            // terminating byte
+    sql_len += columns->nelts-1;        // ","
+    sql_len += 1;                       // ")"
+    sql_len += 1;                       // terminating byte
     
     /*
      * Allocate memory for the statement.
      */
-    u_char *buf = ngx_pcalloc(pool, sql_len);
+    u_char *buf = ngx_calloc(sql_len, log);
     
     /*
      * Create the statement.
      */
-    u_char *joined = ngx_http_sqlite3_log_strings_join(pool, columns, ',');
+    u_char *joined = ngx_http_sqlite3_log_strings_join(columns, ',', log);
     ngx_sprintf(buf, "CREATE TABLE IF NOT EXISTS log (%s)", joined);
     return buf;
 }
@@ -829,30 +786,34 @@ u_char* ngx_http_sqlite3_log_sql_create_table_if_not_exists(ngx_pool_t* pool, ng
  * Create a SQL string in the form of "INSERT INTO log VALUES (?, ?, ?)",
  * where n is the amount of question/placeholder symbols.
  * 
+ * Don't forget to free the string with ngx_free().
+ * 
  * @param   pool    an Nginx memory pool to borrow memory from
  * @param   n       the amount of question/placeholder symbols
- * @return          a heap string allocated in the given pool
+ * @param   log     a log for logging heap allocation errors
+ * @return          a heap string
  */
-u_char* ngx_http_sqlite3_log_sql_insert(ngx_pool_t* pool, ngx_uint_t n) {
+static u_char* ngx_http_sqlite3_log_sql_insert(ngx_pool_t *pool, ngx_uint_t n, ngx_log_t *log) {
     /*
      * Count how many characters the SQL statement will have.
      */
     ngx_str_t init_text = ngx_string("INSERT INTO log VALUES (");
     size_t sql_len = init_text.len; // initial text
     sql_len += n;                   // "?"
-    sql_len += n;                   // ","
+    sql_len += n-1;                 // ","
     sql_len += 1;                   // ")"
+    sql_len += 1;                   // terminating byte
     
     /*
      * Allocate memory for the statement.
      */
-    u_char *buf = ngx_pcalloc(pool, sql_len);
+    u_char *buf = ngx_calloc(sql_len, log);
     
     /*
-     * Create the statement.
+     * Create the "(?, ?, ?)" portion of the string.
      */
     ngx_array_t *questions_arr = ngx_http_sqlite3_log_strings_array(pool, "?", 1, n);
-    u_char *questions_str = ngx_http_sqlite3_log_strings_join(pool, questions_arr, ',');
+    u_char *questions_str = ngx_http_sqlite3_log_strings_join(questions_arr, ',', log);
     ngx_sprintf(buf, "INSERT INTO log VALUES (%s)", questions_str);
     return buf;
 }
@@ -860,22 +821,23 @@ u_char* ngx_http_sqlite3_log_sql_insert(ngx_pool_t* pool, ngx_uint_t n) {
 /*
  * Join multiple strings.
  * 
- * @param   pool        an Nginx memory pool to borrow memory from
  * @param   strings     an Nginx array of strings to join together
  * @param   delimiter   the delimiter symbol to separate each string
+ * @param   log         a log for logging heap allocation errors
  * @return              a heap string allocated in the given pool
  */
-u_char* ngx_http_sqlite3_log_strings_join(ngx_pool_t *pool, ngx_array_t *strings, const u_char delimiter) {
+static u_char* ngx_http_sqlite3_log_strings_join(ngx_array_t *strings, const u_char delimiter, ngx_log_t *log) {
     /*
      * Count how many characters the final string will have.
      */
     size_t len = ngx_http_sqlite3_log_strings_len_total(strings);
-    len += (size_t) strings->nelts;
+    len += (size_t) strings->nelts-1;   // delimiters
+    len +=1 ;                           // terminating byte
     
     /*
      * Allocate memory for the final string.
      */
-    u_char *buf = ngx_pcalloc(pool, len);
+    u_char *buf = ngx_calloc(len, log);
     ngx_uint_t j = 0; // current position
     
     /*
@@ -908,7 +870,7 @@ u_char* ngx_http_sqlite3_log_strings_join(ngx_pool_t *pool, ngx_array_t *strings
  * @param   strings     an Nginx array of Nginx strings
  * @return              the total of each string's len field
  */
-size_t ngx_http_sqlite3_log_strings_len_total(ngx_array_t *strings) {
+static size_t ngx_http_sqlite3_log_strings_len_total(ngx_array_t *strings) {
     size_t sum = 0;
     
     ngx_str_t* s = strings->elts;
@@ -929,7 +891,7 @@ size_t ngx_http_sqlite3_log_strings_len_total(ngx_array_t *strings) {
  * @param   n           how many copies to make
  * @return              an Nginx array allocated in the given pool
  */
-ngx_array_t* ngx_http_sqlite3_log_strings_array(ngx_pool_t *pool, const char* s, size_t s_len, ngx_uint_t n) {
+static ngx_array_t* ngx_http_sqlite3_log_strings_array(ngx_pool_t *pool, const char* s, size_t s_len, ngx_uint_t n) {
     ngx_array_t* arr = ngx_array_create(pool, n, sizeof(ngx_str_t));
     for (ngx_uint_t i=0; i<n; i++) {
         ngx_str_t* ns = ngx_array_push(arr);
@@ -937,4 +899,130 @@ ngx_array_t* ngx_http_sqlite3_log_strings_array(ngx_pool_t *pool, const char* s,
         ns->len = s_len; // ngx_str_set doesn't set the len properly for some reason
     }
     return arr;
+}
+
+/*
+ * Get the length of this variable's evaluated string.
+ * 
+ * This function was copied and pasted from the standard log module
+ * (src/http/modules/ngx_http_log_module.c).
+ * 
+ * @param   r       the current request being processed
+ * @param   data    the variable's index
+ * @return          the size of the evaluated string
+ */
+static size_t ngx_http_sqlite3_log_lm_variable_getlen(ngx_http_request_t *r, uintptr_t data)
+{
+    uintptr_t                   len;
+    ngx_http_variable_value_t  *value;
+
+    value = ngx_http_get_indexed_variable(r, data);
+
+    if (value == NULL || value->not_found) {
+        return 1;
+    }
+
+    len = ngx_http_sqlite3_log_lm_escape(NULL, value->data, value->len);
+
+    value->escape = len ? 1 : 0;
+
+    return value->len + len * 3;
+}
+
+/*
+ * Escape a string so that it's safe to be written to a text file.
+ * 
+ * This function was copied and pasted from the standard log module
+ * (src/http/modules/ngx_http_log_module.c).
+ * 
+ * @param   dst     a buffer to hold the new string
+ * @param   src     the string to escape
+ * @param   size    the length of src
+ * @return          the length of dst
+ */
+static uintptr_t ngx_http_sqlite3_log_lm_escape(u_char *dst, u_char *src, size_t size) {
+    ngx_uint_t      n;
+    static u_char   hex[] = "0123456789ABCDEF";
+
+    static uint32_t   escape[] = {
+        0xffffffff, /* 1111 1111 1111 1111  1111 1111 1111 1111 */
+
+                    /* ?>=< ;:98 7654 3210  /.-, +*)( '&%$ #"!  */
+        0x00000004, /* 0000 0000 0000 0000  0000 0000 0000 0100 */
+
+                    /* _^]\ [ZYX WVUT SRQP  ONML KJIH GFED CBA@ */
+        0x10000000, /* 0001 0000 0000 0000  0000 0000 0000 0000 */
+
+                    /*  ~}| {zyx wvut srqp  onml kjih gfed cba` */
+        0x80000000, /* 1000 0000 0000 0000  0000 0000 0000 0000 */
+
+        0xffffffff, /* 1111 1111 1111 1111  1111 1111 1111 1111 */
+        0xffffffff, /* 1111 1111 1111 1111  1111 1111 1111 1111 */
+        0xffffffff, /* 1111 1111 1111 1111  1111 1111 1111 1111 */
+        0xffffffff, /* 1111 1111 1111 1111  1111 1111 1111 1111 */
+    };
+
+
+    if (dst == NULL) {
+
+        /* find the number of the characters to be escaped */
+
+        n = 0;
+
+        while (size) {
+            if (escape[*src >> 5] & (1U << (*src & 0x1f))) {
+                n++;
+            }
+            src++;
+            size--;
+        }
+
+        return (uintptr_t) n;
+    }
+
+    while (size) {
+        if (escape[*src >> 5] & (1U << (*src & 0x1f))) {
+            *dst++ = '\\';
+            *dst++ = 'x';
+            *dst++ = hex[*src >> 4];
+            *dst++ = hex[*src & 0xf];
+            src++;
+
+        } else {
+            *dst++ = *src++;
+        }
+        size--;
+    }
+
+    return (uintptr_t) dst;
+}
+
+/*
+ * Evaluate a variable into a string value (e.g. $status -> "200").
+ * 
+ * This function was copied and pasted from the standard log module
+ * (src/http/modules/ngx_http_log_module.c).
+ * 
+ * @param   r       the current request being processed
+ * @param   buf     a buffer to hold the output
+ * @param   index   the variable's index
+ * @return          buf
+ */
+static u_char* ngx_http_sqlite3_log_lm_variable(ngx_http_request_t *r, u_char *buf, ngx_int_t index)
+{
+    ngx_http_variable_value_t  *value;
+    
+    value = ngx_http_get_indexed_variable(r, index);
+
+    if (value == NULL || value->not_found) {
+        *buf = '-';
+        return buf + 1;
+    }
+
+    if (value->escape == 0) {
+        return ngx_cpymem(buf, value->data, value->len);
+
+    } else {
+        return (u_char *) ngx_http_sqlite3_log_lm_escape(buf, value->data, value->len);
+    }
 }
