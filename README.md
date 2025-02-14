@@ -17,6 +17,7 @@
 ## Summary
 
 This module uses SQLite format for access logs.
+GitHub fork of https://git.serope.com/me/ngx-sqlitelog
 
 ## Installation
 
